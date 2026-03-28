@@ -71,7 +71,7 @@ def fetch_events(creds, today):
 def fetch_tasks(creds, today):
     service    = build("tasks", "v1", credentials=creds)
     task_lists = service.tasklists().list().execute().get("items", [])
-    cutoff     = today - datetime.timedelta(days=7)
+    upper_limit = today + datetime.timedelta(days=7)
     tasks = []
     for tl in task_lists:
         items = service.tasks().list(
@@ -85,11 +85,12 @@ def fetch_tasks(creds, today):
             raw_due = t.get("due", "")
             if raw_due:
                 due_dt = datetime.datetime.fromisoformat(raw_due.replace("Z", "+00:00")).date()
-                if due_dt < cutoff:
-                    continue
+                if due_dt > upper_limit:
+                    continue  # skip tasks more than 7 days away
                 tasks.append({"title": t.get("title", "Untitled"), "due": due_dt})
             else:
                 tasks.append({"title": t.get("title", "Untitled"), "due": None})
+    # Overdue first, then today, then future, then no due date
     tasks.sort(key=lambda x: (x["due"] is None, x["due"] or datetime.date.max))
     return tasks
 
