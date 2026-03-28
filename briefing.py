@@ -77,7 +77,7 @@ def fetch_tasks(creds, today):
         items = service.tasks().list(
             tasklist=tl["id"],
             showCompleted=False,
-            showHidden=False,
+            showHidden=True,
         ).execute().get("items", [])
         for t in items:
             if t.get("status") == "completed":
