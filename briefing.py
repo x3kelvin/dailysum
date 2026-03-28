@@ -1,23 +1,19 @@
 import os
-import json
 import datetime
 import requests
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
-# ── Config from environment variables ──────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
-ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
-
+TELEGRAM_BOT_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_CHAT_ID     = os.environ["TELEGRAM_CHAT_ID"]
 GOOGLE_CLIENT_ID     = os.environ["GOOGLE_CLIENT_ID"]
 GOOGLE_CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
 GOOGLE_REFRESH_TOKEN = os.environ["GOOGLE_REFRESH_TOKEN"]
 
-TIMEZONE_OFFSET_HOURS = 8  # Singapore (UTC+8)
+NAME            = "Kelvin"
+TIMEZONE_OFFSET = datetime.timedelta(hours=8)
 
-# ── Google credentials ──────────────────────────────────────────────────────────
-def get_google_credentials():
+def get_credentials():
     return Credentials(
         token=None,
         refresh_token=GOOGLE_REFRESH_TOKEN,
@@ -30,17 +26,29 @@ def get_google_credentials():
         ],
     )
 
-# ── Fetch today's calendar events ──────────────────────────────────────────────
-def fetch_events(creds):
-    service = build("calendar", "v3", credentials=creds)
-    now_utc = datetime.datetime.utcnow()
-    # Singapore day boundaries in UTC
-    today_local = now_utc + datetime.timedelta(hours=TIMEZONE_OFFSET_HOURS)
-    day_start = datetime.datetime(today_local.year, today_local.month, today_local.day, 0, 0, 0)
-    day_end   = day_start + datetime.timedelta(days=1)
-    time_min  = (day_start - datetime.timedelta(hours=TIMEZONE_OFFSET_HOURS)).isoformat() + "Z"
-    time_max  = (day_end   - datetime.timedelta(hours=TIMEZONE_OFFSET_HOURS)).isoformat() + "Z"
+def now_sgt():
+    return datetime.datetime.utcnow() + TIMEZONE_OFFSET
 
+def friendly_due_label(due_date, today):
+    delta = (due_date - today).days
+    if delta < 0:
+        days_ago = abs(delta)
+        return f"[Overdue by {days_ago} day{'s' if days_ago > 1 else ''}]"
+    elif delta == 0:
+        return "[Due today]"
+    elif delta == 1:
+        return "[Due tomorrow]"
+    elif delta <= 6:
+        return f"[Due {due_date.strftime('%A')}]"
+    else:
+        return f"[Due {due_date.strftime('%d %b')}]"
+
+def fetch_events(creds, today):
+    service   = build("calendar", "v3", credentials=creds)
+    day_start = datetime.datetime(today.year, today.month, today.day, 0, 0, 0)
+    day_end   = day_start + datetime.timedelta(days=1)
+    time_min  = (day_start - TIMEZONE_OFFSET).strftime("%Y-%m-%dT%H:%M:%SZ")
+    time_max  = (day_end   - TIMEZONE_OFFSET).strftime("%Y-%m-%dT%H:%M:%SZ")
     result = service.events().list(
         calendarId="primary",
         timeMin=time_min,
@@ -48,126 +56,85 @@ def fetch_events(creds):
         singleEvents=True,
         orderBy="startTime",
     ).execute()
-
     events = []
     for e in result.get("items", []):
-        start = e["start"].get("dateTime", e["start"].get("date", ""))
-        end   = e["end"].get("dateTime",   e["end"].get("date", ""))
-        # Convert UTC time to SGT for display
-        if "T" in start:
-            dt = datetime.datetime.fromisoformat(start.replace("Z", "+00:00"))
-            dt_sgt = dt + datetime.timedelta(hours=TIMEZONE_OFFSET_HOURS) if dt.utcoffset() is None else dt.astimezone(datetime.timezone(datetime.timedelta(hours=TIMEZONE_OFFSET_HOURS)))
-            start_str = dt_sgt.strftime("%I:%M %p")
+        raw_start = e["start"].get("dateTime", e["start"].get("date", ""))
+        if "T" in raw_start:
+            dt_utc = datetime.datetime.fromisoformat(raw_start.replace("Z", "+00:00"))
+            dt_sgt = dt_utc.astimezone(datetime.timezone(TIMEZONE_OFFSET))
+            start_str = dt_sgt.strftime("%I:%M %p").lstrip("0")
         else:
             start_str = "All day"
-
-        events.append({
-            "title": e.get("summary", "Untitled"),
-            "start": start_str,
-            "location": e.get("location", ""),
-            "description": e.get("description", "")[:200],
-        })
+        events.append({"title": e.get("summary", "Untitled"), "start": start_str})
     return events
 
-# ── Fetch incomplete tasks ──────────────────────────────────────────────────────
-def fetch_tasks(creds):
-    service = build("tasks", "v1", credentials=creds)
+def fetch_tasks(creds, today):
+    service    = build("tasks", "v1", credentials=creds)
     task_lists = service.tasklists().list().execute().get("items", [])
-
-    all_tasks = []
+    cutoff     = today - datetime.timedelta(days=7)
+    tasks = []
     for tl in task_lists:
-        tasks = service.tasks().list(
+        items = service.tasks().list(
             tasklist=tl["id"],
             showCompleted=False,
             showHidden=False,
         ).execute().get("items", [])
+        for t in items:
+            if t.get("status") == "completed":
+                continue
+            raw_due = t.get("due", "")
+            if raw_due:
+                due_dt = datetime.datetime.fromisoformat(raw_due.replace("Z", "+00:00")).date()
+                if due_dt < cutoff:
+                    continue
+                tasks.append({"title": t.get("title", "Untitled"), "due": due_dt})
+            else:
+                tasks.append({"title": t.get("title", "Untitled"), "due": None})
+    tasks.sort(key=lambda x: (x["due"] is None, x["due"] or datetime.date.max))
+    return tasks
 
+def build_message(events, tasks, today):
+    date_str = today.strftime("%-d %b (%A)")
+    lines = [f"Good morning {NAME}! Here's your day for {date_str}", ""]
+    lines.append("📅 Your Schedule")
+    if events:
+        for e in events:
+            lines.append(f"  {e['start']} — {e['title']}")
+    else:
+        lines.append("  No events today.")
+    lines.append("")
+    lines.append("📋 Pending Tasks")
+    if tasks:
         for t in tasks:
-            if t.get("status") != "completed":
-                due = t.get("due", "")
-                if due:
-                    due_dt = datetime.datetime.fromisoformat(due.replace("Z", "+00:00"))
-                    due_str = due_dt.strftime("%d %b")
-                else:
-                    due_str = "No due date"
-                all_tasks.append({
-                    "title": t.get("title", "Untitled"),
-                    "due": due_str,
-                    "notes": t.get("notes", "")[:100],
-                    "list": tl.get("title", "Tasks"),
-                })
-    return all_tasks
+            if t["due"]:
+                label = friendly_due_label(t["due"], today)
+                lines.append(f"  {label} {t['title']}")
+            else:
+                lines.append(f"  {t['title']}")
+    else:
+        lines.append("  No pending tasks.")
+    return "\n".join(lines)
 
-# ── Ask Claude to write the briefing ───────────────────────────────────────────
-def generate_briefing(events, tasks, today_str):
-    events_text = json.dumps(events, indent=2) if events else "No events today."
-    tasks_text  = json.dumps(tasks,  indent=2) if tasks  else "No pending tasks."
-
-    prompt = f"""Today is {today_str} (Singapore time). 
-
-Here are today's calendar events:
-{events_text}
-
-Here are the user's incomplete tasks/checklists:
-{tasks_text}
-
-Write a friendly, concise daily briefing for the user to receive via Telegram. Format it clearly using plain text (no markdown — Telegram will handle basic formatting). Structure it as:
-
-1. A warm good morning greeting with the date
-2. A "Today's Schedule" section listing events in order with times
-3. A "Pending Tasks" section listing incomplete items, highlighting anything due today or overdue
-4. A short motivational closing line
-
-Keep it punchy and scannable — this is a morning message, not a report. Use line breaks generously. Do NOT use asterisks or markdown symbols."""
-
-    response = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 1000,
-            "messages": [{"role": "user", "content": prompt}],
-        },
-    )
-    response.raise_for_status()
-    return response.json()["content"][0]["text"]
-
-# ── Send to Telegram ────────────────────────────────────────────────────────────
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "",
-    }
-    r = requests.post(url, json=payload)
+    r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message})
     r.raise_for_status()
-    print("Message sent to Telegram successfully.")
+    print("Sent successfully.")
 
-# ── Main ────────────────────────────────────────────────────────────────────────
 def main():
-    creds = get_google_credentials()
-
-    now_sgt = datetime.datetime.utcnow() + datetime.timedelta(hours=TIMEZONE_OFFSET_HOURS)
-    today_str = now_sgt.strftime("%A, %d %B %Y")
-
-    print("Fetching calendar events...")
-    events = fetch_events(creds)
-    print(f"  Found {len(events)} events")
-
+    today = now_sgt().date()
+    creds = get_credentials()
+    print("Fetching events...")
+    events = fetch_events(creds, today)
+    print(f"  {len(events)} events found")
     print("Fetching tasks...")
-    tasks = fetch_tasks(creds)
-    print(f"  Found {len(tasks)} pending tasks")
-
-    print("Generating briefing with Claude...")
-    briefing = generate_briefing(events, tasks, today_str)
-    print("Briefing generated.")
-
-    send_telegram(briefing)
+    tasks = fetch_tasks(creds, today)
+    print(f"  {len(tasks)} tasks found")
+    message = build_message(events, tasks, today)
+    print("\n--- Preview ---")
+    print(message)
+    print("---------------\n")
+    send_telegram(message)
 
 if __name__ == "__main__":
     main()
