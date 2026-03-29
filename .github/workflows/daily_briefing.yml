@@ -3,7 +3,7 @@ name: Daily Briefing
 on:
   schedule:
     # 00:45 UTC = 08:45 Singapore time (UTC+8)
-    - cron: "45 0 * * *"
+    - cron: "45 21 * * *"
   workflow_dispatch:  # Allows manual trigger from GitHub UI for testing
 
 jobs:
